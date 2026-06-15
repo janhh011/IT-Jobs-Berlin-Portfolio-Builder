@@ -1,20 +1,18 @@
 """
-visualize_skills.py — Top-30 skill frequency chart from jobs_berlin.csv.
-Output: skills_chart.png (same directory)
+visualize_skills.py — Top-N skill frequency chart from jobs_berlin_enriched.csv.
+Output: output/skills_chart.png
 """
 
 import csv
+import logging
 from collections import Counter
-from pathlib import Path
 
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 
-# ── Config ───────────────────────────────────────────────────────────────────
+from config import ENRICHED_CSV as DATA_FILE, CHART_PNG as OUTPUT_FILE, TOP_N_SKILLS as TOP_N
 
-DATA_FILE   = Path(__file__).parent / "jobs_berlin.csv"
-OUTPUT_FILE = Path(__file__).parent / "skills_chart.png"
-TOP_N       = 30
+log = logging.getLogger(__name__)
 
 # ── Category → colour mapping ─────────────────────────────────────────────────
 
@@ -86,104 +84,100 @@ CATEGORIES: dict[str, tuple[str, list[str]]] = {
     ]),
 }
 
-# Build reverse lookup: lowercase skill name → (category label, colour)
 _SKILL_TO_CAT: dict[str, tuple[str, str]] = {}
-for cat_name, (colour, skills) in CATEGORIES.items():
-    for s in skills:
-        _SKILL_TO_CAT[s.lower()] = (cat_name, colour)
+for _cat_name, (_colour, _skills) in CATEGORIES.items():
+    for _s in _skills:
+        _SKILL_TO_CAT[_s.lower()] = (_cat_name, _colour)
 
 FALLBACK_COLOUR = "#8B949E"
 FALLBACK_CAT    = "General / Other"
 
 
 def categorise(skill: str) -> tuple[str, str]:
-    """Return (category_label, hex_colour) for a skill string."""
     key = skill.lower().strip()
-    # exact match
     if key in _SKILL_TO_CAT:
         return _SKILL_TO_CAT[key]
-    # substring match (e.g. "Microsoft Azure" contains "azure")
     for stored_key, (cat, colour) in _SKILL_TO_CAT.items():
         if stored_key in key or key in stored_key:
             return cat, colour
     return FALLBACK_CAT, FALLBACK_COLOUR
 
 
-# ── Load & count ──────────────────────────────────────────────────────────────
+# ── run / main ────────────────────────────────────────────────────────────────
 
-counter: Counter = Counter()
-with open(DATA_FILE, encoding="utf-8", newline="") as f:
-    for row in csv.DictReader(f):
-        for skill in row["skills"].split(";"):
-            skill = skill.strip()
-            if skill:
-                counter[skill] += 1
+def run():
+    counter: Counter = Counter()
+    with open(DATA_FILE, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            for skill in row["skills"].split(";"):
+                skill = skill.strip()
+                if skill:
+                    counter[skill] += 1
 
-top_skills = counter.most_common(TOP_N)
-labels  = [s for s, _ in top_skills]
-counts  = [c for _, c in top_skills]
-colours = [categorise(s)[1] for s in labels]
+    top_skills = counter.most_common(TOP_N)
+    labels  = [s for s, _ in top_skills][::-1]
+    counts  = [c for _, c in top_skills][::-1]
+    colours = [categorise(s)[1] for s in labels]
 
-# Reverse so highest bar is at top
-labels  = labels[::-1]
-counts  = counts[::-1]
-colours = colours[::-1]
+    available_styles = plt.style.available
+    for style in ("seaborn-v0_8-whitegrid", "seaborn-whitegrid", "ggplot"):
+        if style in available_styles:
+            plt.style.use(style)
+            break
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(13, 11))
+    bars = ax.barh(labels, counts, color=colours, height=0.7, edgecolor="white", linewidth=0.5)
 
-available_styles = plt.style.available
-for style in ("seaborn-v0_8-whitegrid", "seaborn-whitegrid", "ggplot"):
-    if style in available_styles:
-        plt.style.use(style)
-        break
+    for bar, count in zip(bars, counts):
+        ax.text(
+            bar.get_width() + 2,
+            bar.get_y() + bar.get_height() / 2,
+            str(count),
+            va="center", ha="left",
+            fontsize=9, color="#555555",
+        )
 
-fig, ax = plt.subplots(figsize=(13, 11))
+    ax.set_xlabel("Number of job listings", fontsize=12, labelpad=10)
+    ax.set_title(
+        f"Top {TOP_N} Skills in Berlin IT Jobs  ·  get-in-it.de",
+        fontsize=15, fontweight="bold", pad=18,
+    )
+    ax.set_xlim(0, max(counts) * 1.12)
+    ax.tick_params(axis="y", labelsize=10)
+    ax.tick_params(axis="x", labelsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
-bars = ax.barh(labels, counts, color=colours, height=0.7, edgecolor="white", linewidth=0.5)
+    seen_cats: dict[str, str] = {}
+    for skill, colour in zip(labels, colours):
+        cat, _ = categorise(skill)
+        if cat not in seen_cats:
+            seen_cats[cat] = colour
 
-# Count labels at end of each bar
-for bar, count in zip(bars, counts):
-    ax.text(
-        bar.get_width() + 2,
-        bar.get_y() + bar.get_height() / 2,
-        str(count),
-        va="center", ha="left",
-        fontsize=9, color="#555555",
+    legend_patches = [
+        mpatches.Patch(color=col, label=cat)
+        for cat, col in seen_cats.items()
+    ]
+    ax.legend(
+        handles=legend_patches, loc="lower right",
+        fontsize=9, framealpha=0.85,
+        title="Category", title_fontsize=9,
     )
 
-ax.set_xlabel("Number of job listings", fontsize=12, labelpad=10)
-ax.set_title(
-    f"Top {TOP_N} Skills in Berlin IT Jobs  ·  get-in-it.de",
-    fontsize=15, fontweight="bold", pad=18,
-)
-ax.set_xlim(0, max(counts) * 1.12)
-ax.tick_params(axis="y", labelsize=10)
-ax.tick_params(axis="x", labelsize=9)
-ax.spines["top"].set_visible(False)
-ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    plt.savefig(OUTPUT_FILE, dpi=150, bbox_inches="tight")
+    plt.close()
+    log.info("Chart saved: %s", OUTPUT_FILE)
 
-# Legend
-seen_cats: dict[str, str] = {}
-for skill, colour in zip(labels, colours):
-    cat, _ = categorise(skill)
-    if cat not in seen_cats:
-        seen_cats[cat] = colour
 
-legend_patches = [
-    mpatches.Patch(color=col, label=cat)
-    for cat, col in seen_cats.items()
-]
-ax.legend(
-    handles=legend_patches,
-    loc="lower right",
-    fontsize=9,
-    framealpha=0.85,
-    title="Category",
-    title_fontsize=9,
-)
+def main():
+    run()
 
-plt.tight_layout()
-plt.savefig(OUTPUT_FILE, dpi=150, bbox_inches="tight")
-plt.close()
 
-print(f"Saved: {OUTPUT_FILE}")
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    main()

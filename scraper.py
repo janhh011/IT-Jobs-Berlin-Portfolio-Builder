@@ -1,21 +1,19 @@
 import asyncio
 import csv
+import logging
 import re
 import sys
-from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-START_URL   = "https://www.get-in-it.de/it-jobs-berlin"
-SEARCH_URL  = "https://www.get-in-it.de/jobsuche?city=6176&radius=25"
-BASE_URL    = "https://www.get-in-it.de"
-OUTPUT_FILE = Path(__file__).parent / "jobs_berlin.csv"
-CONCURRENCY = 8
-PAGE_TIMEOUT = 30_000  # ms
+from config import (
+    START_URL, SEARCH_URL, BASE_URL,
+    RAW_CSV, CONCURRENCY, PAGE_TIMEOUT, SKIP_BADGE_TEXTS,
+)
 
-SKIP_BADGE_TEXTS = {"Tipp", "Neu", "Top"}
+log = logging.getLogger(__name__)
 
 
-# ── helper: accept cookie banner once ───────────────────────────────────────
+# ── helper: accept cookie banner once ────────────────────────────────────────
 
 async def accept_cookies(page):
     try:
@@ -27,21 +25,18 @@ async def accept_cookies(page):
         pass
 
 
-# ── Step 1: collect all job URLs via "Mehr anzeigen" ───────────────────────
+# ── Step 1: collect all job URLs via "Mehr anzeigen" ─────────────────────────
 
 async def collect_job_urls(browser) -> list[str]:
     page = await browser.new_page()
 
-    # Land on the city page, then follow "Alle anzeigen" to the full search
     await page.goto(START_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_timeout(1_500)
     await accept_cookies(page)
 
-    # Navigate to the full search listing for Berlin
     await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=60_000)
     await page.wait_for_timeout(1_500)
 
-    # Click "Mehr anzeigen" until it's gone
     clicked = 0
     while True:
         await page.wait_for_timeout(700)
@@ -51,7 +46,7 @@ async def collect_job_urls(browser) -> list[str]:
                 await btn.scroll_into_view_if_needed()
                 await btn.click()
                 clicked += 1
-                print(f"  'Mehr anzeigen' click #{clicked}", flush=True)
+                log.info("'Mehr anzeigen' click #%d", clicked)
             else:
                 break
         except PWTimeout:
@@ -59,7 +54,6 @@ async def collect_job_urls(browser) -> list[str]:
         except Exception:
             break
 
-    # Collect unique job hrefs
     anchors = await page.locator('a[href*="/jobsuche/p"]').all()
     seen: set[str] = set()
     urls: list[str] = []
@@ -70,11 +64,11 @@ async def collect_job_urls(browser) -> list[str]:
             urls.append(BASE_URL + href if href.startswith("/") else href)
 
     await page.close()
-    print(f"  collected {len(urls)} job URLs", flush=True)
+    log.info("Collected %d job URLs", len(urls))
     return urls
 
 
-# ── Step 2: scrape one job detail page ──────────────────────────────────────
+# ── Step 2: scrape one job detail page ───────────────────────────────────────
 
 async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | None:
     async with semaphore:
@@ -83,6 +77,7 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
             await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
             await page.wait_for_timeout(500)
         except Exception as e:
+            log.warning("SKIP %s: %s", url, e)
             await page.close()
             return None
 
@@ -100,7 +95,6 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
                     company = (await el.get_attribute("alt") or "").strip()
                 except Exception:
                     pass
-            # page-title fallback: "JobTitle | Company | get in IT"
             if not company:
                 m = re.search(r"\|\s*(.+?)\s*\|\s*get in IT", await page.title(), re.I)
                 if m:
@@ -124,7 +118,6 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
                     h_text = (await h.text_content() or "").strip()
                     if not any(kw.lower() in h_text.lower() for kw in relevant_kws):
                         continue
-                    # grab all text from sibling elements until next heading
                     section_text = await page.evaluate("""(el) => {
                         let parts = [];
                         let sib = el.nextElementSibling;
@@ -140,7 +133,6 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
             except Exception:
                 pass
 
-            # broad fallback if nothing found
             if not desc_parts:
                 try:
                     for sel in ["main", "article", '[class*="JobContent"]', '[class*="job-content"]']:
@@ -157,7 +149,6 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
             description = re.sub(r"\s+", " ", description).strip()
 
             # ── skills: badge chips in job header ─────────────────────────
-            # Primary: JobHeaderRegular_jobBadge elements (technology tags)
             skill_tags: list[str] = []
             try:
                 badges = await page.locator('[class*="jobBadge"], [class*="JobBadge"]').all()
@@ -168,14 +159,12 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
             except Exception:
                 pass
 
-            # Secondary: JobInfo section (Berufsfelder, Studienfächer, Abschluss)
             if not skill_tags:
                 try:
                     info_rows = await page.locator('[class*="JobInfo_info"]').all()
                     for row in info_rows:
                         txt = (await row.text_content() or "").strip()
                         if txt:
-                            # strip label (e.g. "Berufsfelder") and split entries
                             parts = re.split(r"^[A-ZÄÖÜ][a-zäöü]+\s*", txt)
                             for part in parts:
                                 for item in re.split(r"[\n,]", part):
@@ -185,7 +174,6 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
                 except Exception:
                     pass
 
-            # Deduplicate, strip noise
             skip_re = re.compile(
                 r"^(berlin|münchen|hamburg|köln|frankfurt|vollzeit|teilzeit|"
                 r"praktikum|werkstudent|\d{4}|anzeigen|profil|login)$", re.I
@@ -204,35 +192,32 @@ async def scrape_job(context, url: str, semaphore: asyncio.Semaphore) -> dict | 
             }
 
         except Exception as e:
-            print(f"  ERROR {url}: {e}", flush=True)
+            log.error("Error parsing %s: %s", url, e)
             return None
         finally:
             await page.close()
 
 
-# ── Step 3: main ─────────────────────────────────────────────────────────────
+# ── run / main ────────────────────────────────────────────────────────────────
 
-async def main():
-    print("Step 1 — loading all Berlin IT job listings …", flush=True)
+async def run():
+    log.info("Step 1 — loading all Berlin IT job listings …")
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
 
-        # Collect URLs from listing page
         job_urls = await collect_job_urls(browser)
         if not job_urls:
-            print("No job URLs found — aborting.", file=sys.stderr)
+            log.error("No job URLs found — aborting.")
             await browser.close()
             return
 
-        # Create a shared context so cookies carry over to all detail pages
         context = await browser.new_context()
-        # Prime cookies by visiting the site once
         priming = await context.new_page()
         await priming.goto(BASE_URL, wait_until="domcontentloaded", timeout=15_000)
         await accept_cookies(priming)
         await priming.close()
 
-        print(f"\nStep 2 — scraping {len(job_urls)} job pages (concurrency={CONCURRENCY}) …", flush=True)
+        log.info("Step 2 — scraping %d job pages (concurrency=%d) …", len(job_urls), CONCURRENCY)
         semaphore = asyncio.Semaphore(CONCURRENCY)
         tasks = [scrape_job(context, url, semaphore) for url in job_urls]
 
@@ -244,31 +229,29 @@ async def main():
             if row:
                 results.append(row)
             if done % 100 == 0 or done == len(job_urls):
-                print(f"  {done}/{len(job_urls)} pages done, {len(results)} successful", flush=True)
+                log.info("  %d/%d pages done, %d successful", done, len(job_urls), len(results))
 
         await context.close()
         await browser.close()
 
-    print(f"\nStep 3 — writing {len(results)} rows …", flush=True)
+    log.info("Step 3 — writing %d rows to %s …", len(results), RAW_CSV)
     fieldnames = ["company_name", "position_name", "position_description", "skills"]
-    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
+    with open(RAW_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"\nDone. {len(results)} rows → {OUTPUT_FILE}\n")
+    log.info("Done. %d rows → %s", len(results), RAW_CSV)
 
-    # Show first 2 data rows
-    print("── First 2 rows (truncated) ───────────────────────────────")
-    with open(OUTPUT_FILE, encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if i >= 3:
-                break
-            # truncate long fields for display
-            cols = line.rstrip().split(",")
-            truncated = [c[:80] + "…" if len(c) > 80 else c for c in cols]
-            print(",".join(truncated))
+
+def main():
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    main()
